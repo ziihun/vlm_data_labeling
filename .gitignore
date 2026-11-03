@@ -1,0 +1,17 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Local datasets and virtual environments
+raw_datasets/
+.venv/
+.venv-sam2/
+__pycache__/
+*.py[cod]
+
+# Generated pilot artifacts (frames and API outputs)
+vqa_datasets/
+
+# macOS
+.DS_Store
