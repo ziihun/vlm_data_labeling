@@ -3,15 +3,51 @@
 .env.*
 !.env.example
 
-# Local datasets and virtual environments
-raw_datasets/
+# Local datasets
+/data/
+/dataset/
+/datasets/
+/raw_data/
+/raw_datasets/
+/vqa_datasets/
+/outputs/
+
+# Model weights and local downloads
+/models/
+/checkpoints/
+/downloads/
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+
+# Virtual environments and Python caches
 .venv/
 .venv-sam2/
+.venv-qwen/
+.venv-naming-models/
+.venv-hf-vlm/
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
-# Generated pilot artifacts (frames and API outputs)
-vqa_datasets/
+# Generated logs and archives
+/logs/
+*.log
+*.zip
 
-# macOS
+# Large local media
+*.mp4
+*.mov
+*.avi
+*.mkv
+
+# OS and editor files
 .DS_Store
+Thumbs.db
+*.swp
+*.swo

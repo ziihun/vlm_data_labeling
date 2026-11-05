@@ -1,0 +1,10 @@
+torch>=2.7
+torchvision
+transformers==4.57.1
+accelerate>=1.0
+Pillow>=11.0,<13
+einops
+timm>=1.0
+sentencepiece
+decord2
+molmo_utils

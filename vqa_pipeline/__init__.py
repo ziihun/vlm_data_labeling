@@ -1,18 +1,5 @@
-"""Class-based pilot VQA dataset generation pipeline."""
+"""Human-gated SAM 3 and Qwen Video VQA dataset pipeline."""
 
-from .analyzer import OpenAIVQAAnalyzer
-from .artifacts import ArtifactWriter
-from .config import PilotConfig
-from .dataset import DatasetCatalog
-from .models import CATEGORY_ORDER, VideoVQA
-from .video import VideoProcessor
+from .spec_models import CATEGORY_ORDER, DraftVQABatch, HumanReview, VerifiedAnnotation
 
-__all__ = [
-    "ArtifactWriter",
-    "CATEGORY_ORDER",
-    "DatasetCatalog",
-    "OpenAIVQAAnalyzer",
-    "PilotConfig",
-    "VideoProcessor",
-    "VideoVQA",
-]
+__all__ = ["CATEGORY_ORDER", "DraftVQABatch", "HumanReview", "VerifiedAnnotation"]

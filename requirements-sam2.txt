@@ -1,7 +1,0 @@
-# Python 3.12 environment used only by workers/sam2_segment.py
-torch==2.15.0
-torchvision==0.29.2
-transformers==5.22.1
-accelerate==1.15.0
-pillow==13.0.0
-numpy==2.5.4

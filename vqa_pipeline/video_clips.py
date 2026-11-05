@@ -224,12 +224,12 @@ class OverlappingClipPreprocessor:
                 "clip_seconds": self.clip_seconds,
                 "stride_seconds": self.stride_seconds,
                 "tracking_fps": self.tracking_fps,
-                "dam_representative_frames_are_not_tracking_frames": True,
+                "naming_representative_frames_are_not_tracking_frames": True,
             },
             "clips": clips,
         }
         output_root.mkdir(parents=True, exist_ok=True)
-        (output_root / "preprocessing.json").write_text(
+        (output_root / "manifest.json").write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )

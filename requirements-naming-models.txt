@@ -1,0 +1,11 @@
+torch>=2.7
+torchvision
+transformers>=4.50.0,<4.51
+accelerate>=1.0
+numpy>=2.0
+Pillow>=11.0,<13
+scipy
+timm>=1.0.22
+fairscale>=0.4.13
+ultralytics>=8.4.0
+git+https://github.com/xinyu1205/recognize-anything.git

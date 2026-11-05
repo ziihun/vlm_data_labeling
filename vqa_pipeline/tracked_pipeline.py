@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import argparse
-import html
 import json
 import os
 import shutil
 import subprocess
+import traceback
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,341 +14,292 @@ from typing import Any
 from dotenv import load_dotenv
 from openai import OpenAI
 
+from .annotation import apply_human_review, build_pending_annotation
+from .crops import MarginCropGenerator
+from .openai_vqa import OpenAIVQAGenerator, apply_final_review
+from .report import StageReport
+from .naming_experiment import prepare_assets
+from .spec_models import DraftVQABatch, FinalVQAReview, HumanReview
 from .track_merge import OverlapTrackMerger
-from .tracked_analyzer import (
-    DAMTrackDescriber,
-    OpenAITrackedAnalyzer,
-    Sam3NameVerifier,
-)
-from .tracking_models import TrackDescription, TrackedAnnotation
 from .video_clips import OverlappingClipPreprocessor
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_VIDEO = (
-    PROJECT_ROOT
-    / "raw_datasets"
-    / "Safe_and_Unsafe_Behaviours"
-    / "data"
-    / "0_te1.mp4"
-)
-DEFAULT_OUTPUT = PROJECT_ROOT / "vqa_datasets" / "tracked_mvp" / "0_te1"
+DEFAULT_VIDEO = PROJECT_ROOT / "raw_datasets" / "Safe_and_Unsafe_Behaviours" / "data" / "0_te1.mp4"
+DEFAULT_OUTPUT = PROJECT_ROOT / "outputs" / "0_te1"
 
 
 @dataclass(frozen=True, slots=True)
-class TrackedPipelineConfig:
+class Config:
     video_path: Path
     output_root: Path
-    model: str
-    sam2_python: Path
+    vision_python: Path
+    qwen_python: Path
+    openai_model: str
+    naming_model: str = "mlx-community/Qwen3.5-9B-MLX-4bit"
+    stop_after: str = "vqa"
+    segmenter: str = "sam2"
     clip_seconds: float = 10.0
     stride_seconds: float = 5.0
     tracking_fps: float = 5.0
-    strict_models: bool = False
-    strict_verification: bool = False
-    dam_base_url: str | None = None
-    sam3_base_url: str | None = None
+    redetect_interval_frames: int = 10
+    lean: bool = False
 
 
-class Sam2TrackingRunner:
-    def __init__(self, python_path: Path, worker_path: Path) -> None:
-        self.python_path = python_path
-        self.worker_path = worker_path
-
-    def run(self, manifest_path: Path, clip_index: int, output_dir: Path) -> dict[str, Any]:
-        result_path = output_dir / "tracking.json"
-        if result_path.exists():
-            return json.loads(result_path.read_text(encoding="utf-8"))
-        environment = os.environ.copy()
-        environment.update(
-            {
-                "HF_HUB_OFFLINE": "1",
-                "TRANSFORMERS_OFFLINE": "1",
-                "PYTORCH_ENABLE_MPS_FALLBACK": "1",
-            }
-        )
-        command = [
-            str(self.python_path),
-            str(self.worker_path),
-            "--preprocessing-manifest",
-            str(manifest_path),
-            "--clip-index",
-            str(clip_index),
-            "--output-dir",
-            str(output_dir),
-        ]
-        try:
-            completed = subprocess.run(
-                command,
-                check=True,
-                capture_output=True,
-                text=True,
-                env=environment,
-            )
-        except subprocess.CalledProcessError as exc:
-            detail = (exc.stderr or exc.stdout or "no output")[-8000:]
-            raise RuntimeError(f"SAM2 tracking failed: {detail}") from exc
-        if not result_path.exists():
-            raise RuntimeError(f"SAM2 worker returned no tracking.json: {completed.stdout}")
-        return json.loads(result_path.read_text(encoding="utf-8"))
+def write_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-class TrackedArtifactWriter:
-    def __init__(self, output_root: Path) -> None:
-        self.output_root = output_root
-        output_root.mkdir(parents=True, exist_ok=True)
-
-    @staticmethod
-    def write_json(path: Path, payload: Any) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(path.suffix + ".tmp")
-        temporary.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        temporary.replace(path)
-
-    @staticmethod
-    def build_overlay_video(tracking_root: Path) -> Path:
-        output = tracking_root / "tracking_overlay_5fps.mp4"
-        if output.exists():
-            return output
-        subprocess.run(
-            [
-                "ffmpeg",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-y",
-                "-framerate",
-                "5",
-                "-i",
-                str(tracking_root / "overlays" / "%06d.png"),
-                "-c:v",
-                "libx264",
-                "-pix_fmt",
-                "yuv420p",
-                str(output),
-            ],
-            check=True,
-        )
-        return output
-
-    def write_report(self, manifest: dict[str, Any]) -> Path:
-        preprocessing = manifest["stages"]["01_preprocessing"]["output"]
-        tracking = manifest["stages"]["02_sam2_tracking"]["output"]
-        merged = manifest["stages"]["03_overlap_merge"]["output"]
-        descriptions = manifest["stages"]["04_dam_description"]["output"]
-        annotation = manifest["stages"]["05_openai_normalization"]["output"]
-        verification = manifest["stages"]["06_sam3_verification"]["output"]
-        vqa = manifest["stages"]["07_vqa"]["output"]
-
-        clip_sections = []
-        for clip, result in zip(preprocessing["clips"], tracking, strict=True):
-            clip_index = int(clip["clip_index"])
-            clip_sections.append(
-                f"""<section class="card"><h2>{html.escape(clip['clip_id'])}</h2>
-                <p>Source FPS {clip['source_fps']:.2f} · Track FPS {clip['tracking_fps']:.1f} · {result['tracking_frame_count']} tracking frames · {result['initial_object_count']} tracks</p>
-                <div class="videos"><figure><video controls src="{html.escape(str(Path(clip['clip_path']).relative_to(self.output_root)))}"></video><figcaption>원본 FPS Clip</figcaption></figure>
-                <figure><video controls src="sam2/clip_{clip_index:03d}/tracking_overlay_5fps.mp4"></video><figcaption>SAM2 Track ID + Mask</figcaption></figure></div></section>"""
-            )
-        description_by_id = {item["global_track_id"]: item for item in descriptions}
-        verification_by_id = {item["global_track_id"]: item for item in verification}
-        track_rows = "".join(
-            f"<tr><td>{track['global_track_id']}</td><td>{html.escape(', '.join(track['local_track_ids']))}</td><td>{len(track['representative_frames'])}</td><td>{html.escape(description_by_id[track['global_track_id']]['description'])}</td><td>{verification_by_id[track['global_track_id']]['status']}</td></tr>"
-            for track in merged["global_tracks"]
-        )
-        change_rows = "".join(
-            f"<tr><td>{change['change_id']}</td><td>{change['change_type']}</td><td>{html.escape(change['before_state'])}</td><td>{html.escape(change['after_state'])}</td><td>{change['before_timestamp_seconds']:.3f}, {change['after_timestamp_seconds']:.3f}</td></tr>"
-            for change in annotation["observed_changes"]
-        ) or '<tr><td colspan="5">직접 관찰된 before/after 변화 없음</td></tr>'
-        vqa_rows = "".join(
-            f"<tr><td>{item['category']}</td><td>{html.escape(item['question'])}</td><td>{html.escape(item['answer'])}</td><td>{html.escape(str(item['evidence']['source_timestamps_seconds']))}</td></tr>"
-            for item in vqa["items"]
-        ) or '<tr><td colspan="4">생성 가능한 근거 문항 없음</td></tr>'
-        skipped_rows = "".join(
-            f"<tr><td>{item['category']}</td><td>{item['reason_code']}</td><td>{html.escape(item['detail'])}</td></tr>"
-            for item in vqa["skipped_categories"]
-        )
-        document = f"""<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Tracked VQA MVP</title>
-<style>body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f3f5f7;max-width:1500px;margin:auto;padding:24px;color:#17202a}}.card{{background:white;padding:20px;border-radius:14px;margin-bottom:22px;box-shadow:0 2px 14px #0001}}.hero{{border-left:8px solid #2471a3}}.videos{{display:grid;grid-template-columns:repeat(auto-fit,minmax(420px,1fr));gap:16px}}video{{width:100%;background:#111}}figure{{margin:0}}table{{width:100%;border-collapse:collapse;font-size:14px}}th,td{{border:1px solid #d5d8dc;padding:8px;text-align:left;vertical-align:top}}th{{background:#eef2f3}}pre{{white-space:pre-wrap;word-break:break-word;background:#f8f9f9;padding:14px}}</style></head><body>
-<section class="card hero"><h1>Track-grounded VQA MVP · {html.escape(manifest['video_id'])}</h1><p>원본 FPS Clip → 5 FPS SAM2 tracking → Track별 최대 8 DAM frames → 구조화 → SAM3 IoU → 보수적 VQA</p><video controls src="source_video.mp4"></video></section>
-{''.join(clip_sections)}
-<section class="card"><h2>Overlap Track 병합</h2><p>local tracks {sum(item['initial_object_count'] for item in tracking)} → global tracks {merged['global_track_count']}</p><table><thead><tr><th>Global</th><th>Local</th><th>DAM frames</th><th>Description</th><th>SAM3</th></tr></thead><tbody>{track_rows}</tbody></table></section>
-<section class="card"><h2>직접 관찰된 변화</h2><table><thead><tr><th>ID</th><th>Type</th><th>Before</th><th>After</th><th>Evidence metadata only</th></tr></thead><tbody>{change_rows}</tbody></table></section>
-<section class="card"><h2>생성된 VQA</h2><p>Timestamp와 frame index는 Evidence 열에만 표시된다.</p><table><thead><tr><th>Category</th><th>Question</th><th>Answer</th><th>Evidence timestamps</th></tr></thead><tbody>{vqa_rows}</tbody></table></section>
-<section class="card"><h2>생성하지 않은 카테고리</h2><table><thead><tr><th>Category</th><th>Reason</th><th>Detail</th></tr></thead><tbody>{skipped_rows}</tbody></table><details><summary>Full manifest</summary><pre>{html.escape(json.dumps(manifest, ensure_ascii=False, indent=2))}</pre></details></section>
-</body></html>"""
-        path = self.output_root / "report.html"
-        path.write_text(document, encoding="utf-8")
-        return path
-
-
-class TrackedVQAPipeline:
-    def __init__(self, config: TrackedPipelineConfig, api_key: str) -> None:
+class Pipeline:
+    def __init__(self, config: Config) -> None:
         self.config = config
-        self.client = OpenAI(api_key=api_key, timeout=300.0, max_retries=2)
-        self.writer = TrackedArtifactWriter(config.output_root)
-        self.preprocessor = OverlappingClipPreprocessor(
-            clip_seconds=config.clip_seconds,
-            stride_seconds=config.stride_seconds,
-            tracking_fps=config.tracking_fps,
+        if config.segmenter not in {"sam2", "sam3"}:
+            raise ValueError("segmenter must be sam2 or sam3")
+        self.stage01 = f"01_{config.segmenter}"
+        self.stage_names = (
+            "00_preprocessing", self.stage01, "02_crops", "03_qwen_naming",
+            "04_annotation", "05_human_review", "06_vqa", "07_final",
         )
-        self.sam2 = Sam2TrackingRunner(
-            config.sam2_python,
-            PROJECT_ROOT / "workers" / "sam2_track.py",
-        )
-        self.dam = DAMTrackDescriber(
-            self.client, config.model, config.dam_base_url
-        )
-        self.analyzer = OpenAITrackedAnalyzer(self.client, config.model)
-        self.sam3 = Sam3NameVerifier(config.sam3_base_url)
+        self.reporter = StageReport(config.output_root)
+        self.manifest_path = config.output_root / "manifest.json"
+        self.manifest = {
+            "schema_version": "2.0.0-revised-spec",
+            "video_id": config.video_path.stem,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "pipeline": f"{config.segmenter.upper()} -> process exit -> Qwen3.5-9B -> process exit -> Structured Annotation -> separate VQA process",
+            "segmentation_model": config.segmenter,
+            "language_policy": {"prompts": "English", "json_keys_and_values": "English", "final_question_answer": "English", "html_ui": "Korean"},
+            "stages": {name: {"status": "skipped", "detail": "Not executed yet"} for name in self.stage_names},
+        }
+        config.output_root.mkdir(parents=True, exist_ok=True)
+
+    def status(self, stage: str, status: str, detail: str, **extra: Any) -> None:
+        self.manifest["stages"][stage] = {"status": status, "detail": detail, **extra}
+        write_json(self.manifest_path, self.manifest)
+
+    def fail_remaining(self, failed_stage: str, detail: str, preprocessing: dict | None = None, clips: list | None = None, pending: dict | None = None) -> Path:
+        self.status(failed_stage, "failed", detail, traceback=traceback.format_exc())
+        failed_index = self.stage_names.index(failed_stage)
+        for stage in self.stage_names[failed_index + 1 :]:
+            self.manifest["stages"][stage] = {"status": "skipped", "detail": f"Blocked by {failed_stage}"}
+        write_json(self.manifest_path, self.manifest)
+        if self.config.lean:
+            return self.manifest_path
+        return self.reporter.write(self.manifest, preprocessing, clips, pending, None)
+
+    @staticmethod
+    def run_process(command: list[str], env: dict[str, str] | None = None) -> None:
+        completed = subprocess.run(command, text=True, capture_output=True, env=env)
+        if completed.stdout:
+            print(completed.stdout, end="", flush=True)
+        if completed.returncode:
+            raise RuntimeError((completed.stderr or completed.stdout or "Process failed")[-12000:])
+
+    @staticmethod
+    def overlay_video(root: Path, fps: float) -> None:
+        output = root / "tracking_overlay.mp4"
+        if output.exists():
+            return
+        subprocess.run([
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-framerate", f"{fps:g}", "-i", str(root / "overlays" / "%06d.png"),
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", str(output),
+        ], check=True)
 
     def run(self) -> Path:
-        if self.config.strict_models and not self.config.dam_base_url:
-            raise RuntimeError("strict_models requires DAM_BASE_URL")
-        if self.config.strict_models and not self.config.sam3_base_url:
-            raise RuntimeError("strict_models requires SAM3_BASE_URL")
-        output_root = self.config.output_root
-        shutil.copy2(self.config.video_path, output_root / "source_video.mp4")
-        video_id = self.config.video_path.stem
-        preprocessing = self.preprocessor.prepare(
-            self.config.video_path, output_root, video_id
-        )
+        output = self.config.output_root
+        if not self.config.lean:
+            shutil.copy2(self.config.video_path, output / "source_video.mp4")
+        preprocessing = None
+        clip_results: list[dict[str, Any]] = []
+        pending = None
 
-        track_results = []
-        track_roots = []
-        for clip in preprocessing["clips"]:
-            clip_index = int(clip["clip_index"])
-            root = output_root / "sam2" / f"clip_{clip_index:03d}"
-            print(f"SAM2 tracking clip {clip_index + 1}/{len(preprocessing['clips'])}", flush=True)
-            result = self.sam2.run(
-                output_root / "preprocessing.json", clip_index, root
-            )
-            self.writer.build_overlay_video(root)
-            track_results.append(result)
-            track_roots.append(root)
+        try:
+            stage00 = output / "00_preprocessing"
+            preprocessing = OverlappingClipPreprocessor(
+                self.config.clip_seconds, self.config.stride_seconds, self.config.tracking_fps
+            ).prepare(self.config.video_path, stage00, self.config.video_path.stem)
+            self.status("00_preprocessing", "completed", f"{len(preprocessing['clips'])} clips; source FPS preserved", artifact="00_preprocessing/manifest.json")
+        except Exception as exc:
+            return self.fail_remaining("00_preprocessing", f"{type(exc).__name__}: {exc}")
 
-        merged = OverlapTrackMerger().merge(list(zip(track_results, track_roots, strict=True)))
-        self.writer.write_json(output_root / "merged_tracks.json", merged)
+        try:
+            if not self.config.vision_python.exists():
+                raise RuntimeError(f"Vision Python environment not found: {self.config.vision_python}")
+            roots = []
+            for clip in preprocessing["clips"]:
+                index = int(clip["clip_index"])
+                root = output / self.stage01 / f"clip_{index:03d}"
+                result_path = root / "tracks.json"
+                if result_path.exists():
+                    result = json.loads(result_path.read_text(encoding="utf-8"))
+                else:
+                    print(f"[01] {self.config.segmenter.upper()} clip {index + 1}/{len(preprocessing['clips'])}", flush=True)
+                    command = [
+                        str(self.config.vision_python), str(PROJECT_ROOT / "workers" / f"{self.config.segmenter}_track.py"),
+                        "--preprocessing-manifest", str(stage00 / "manifest.json"),
+                        "--clip-index", str(index), "--output-dir", str(root),
+                        "--redetect-interval-frames", str(self.config.redetect_interval_frames),
+                    ]
+                    if self.config.lean:
+                        command.append("--no-render")
+                    self.run_process(command, os.environ.copy())
+                    result = json.loads(result_path.read_text(encoding="utf-8"))
+                if not self.config.lean:
+                    self.overlay_video(root, self.config.tracking_fps)
+                clip_results.append(result)
+                roots.append(root)
+            merged = OverlapTrackMerger().merge(list(zip(clip_results, roots, strict=True)))
+            write_json(output / self.stage01 / "tracks.json", merged)
+            devices = sorted({item["device"] for item in clip_results})
+            model_id = clip_results[0]["model"]
+            cuda_note = ""
+            if self.config.segmenter == "sam3":
+                official_cuda = all(item["official_cuda_prerequisite_met"] for item in clip_results)
+                cuda_note = f"; official CUDA prerequisite met={official_cuda}"
+            detail = f"{merged['track_count']} global Tracks; devices={devices}{cuda_note}"
+            self.status(self.stage01, "completed", detail, model=model_id, artifact=f"{self.stage01}/tracks.json", local_track_count=sum(item["track_count"] for item in clip_results), global_track_count=merged["track_count"])
+        except Exception as exc:
+            return self.fail_remaining(self.stage01, f"{type(exc).__name__}: {exc}", preprocessing, clip_results)
 
-        descriptions = []
-        for index, track in enumerate(merged["global_tracks"]):
-            description_path = output_root / "dam" / f"{track['global_track_id']}.json"
-            if description_path.exists():
-                description = TrackDescription.model_validate_json(
-                    description_path.read_text(encoding="utf-8")
-                )
+        try:
+            crops = MarginCropGenerator(0.20, 8).run(merged, output / "02_crops")
+            self.status("02_crops", "completed", f"20% margin crops for {len(crops['tracks'])} Tracks", artifact="02_crops/crops.json")
+        except Exception as exc:
+            return self.fail_remaining("02_crops", f"{type(exc).__name__}: {exc}", preprocessing, clip_results)
+
+        if self.config.stop_after == "sam":
+            self.status("03_qwen_naming", "skipped", "Separate process boundary: rerun with --stop-after naming")
+            self.status("04_annotation", "skipped", "Naming process has not run")
+            self.status("05_human_review", "skipped", "Naming process has not run")
+            self.status("06_vqa", "skipped", "VQA process has not run")
+            self.status("07_final", "skipped", "VQA process has not run")
+            if self.config.lean:
+                shutil.rmtree(output / "00_preprocessing" / "clips", ignore_errors=True)
+                for clip_root in (output / self.stage01).glob("clip_*"):
+                    if clip_root.is_dir():
+                        shutil.rmtree(clip_root)
+                return self.manifest_path
+            return self.reporter.write(self.manifest, preprocessing, clip_results, None, None)
+
+        try:
+            naming_dir = output / "03_qwen_naming"
+            naming_path = naming_dir / "naming.json"
+            existing_model = None
+            if naming_path.exists():
+                existing_model = json.loads(naming_path.read_text(encoding="utf-8")).get("model")
+            if not naming_path.exists() or existing_model != self.config.naming_model:
+                if not self.config.qwen_python.exists():
+                    raise RuntimeError(f"Qwen MLX Python environment not found: {self.config.qwen_python}")
+                assets_dir = naming_dir / "input"
+                prepare_assets(output / "02_crops" / "crops.json", assets_dir, output / self.stage01 / "tracks.json")
+                print(f"[03] {self.config.naming_model} object naming (separate process)", flush=True)
+                self.run_process([
+                    str(self.config.qwen_python), str(PROJECT_ROOT / "workers" / "local_vlm_name.py"),
+                    "--assets-json", str(assets_dir / "assets.json"),
+                    "--output-dir", str(naming_dir),
+                    "--model", self.config.naming_model,
+                ], os.environ.copy())
+            naming = json.loads(naming_path.read_text(encoding="utf-8"))
+            if {item["track_id"] for item in naming["items"]} != {item["track_id"] for item in merged["tracks"]}:
+                raise ValueError("Qwen naming does not cover every Track")
+            self.status("03_qwen_naming", "completed", f"Named {len(naming['items'])} Tracks; human verification still required", model=naming["model"], artifacts=["03_qwen_naming/prompt.txt", "03_qwen_naming/raw_response.json", "03_qwen_naming/naming.json"])
+        except Exception as exc:
+            return self.fail_remaining("03_qwen_naming", f"{type(exc).__name__}: {exc}", preprocessing, clip_results)
+
+        try:
+            pending = build_pending_annotation(self.config.video_path.stem, merged, crops, naming, output / "04_annotation")
+            self.status("04_annotation", "completed", f"{len(pending['objects'])} pending objects; not benchmark ground truth", artifact="04_annotation/objects.json")
+        except Exception as exc:
+            return self.fail_remaining("04_annotation", f"{type(exc).__name__}: {exc}", preprocessing, clip_results)
+
+        if self.config.stop_after == "naming":
+            self.status("05_human_review", "pending_review", "Review unknown or confidence < 0.7 Tracks before final VQA")
+            self.status("06_vqa", "skipped", "Separate VQA process has not run")
+            self.status("07_final", "skipped", "VQA process has not run")
+            return self.reporter.write(self.manifest, preprocessing, clip_results, pending, None)
+
+        review_dir = output / "05_human_review"
+        review_dir.mkdir(parents=True, exist_ok=True)
+        review_path = review_dir / "review.json"
+        if not review_path.exists():
+            (review_dir / "README.txt").write_text("Use report.html to review every object, download review.json, and place it in this directory.\n", encoding="utf-8")
+            self.status("05_human_review", "pending_review", "Open report.html, verify all object names/attributes/states, then save review.json here")
+            self.status("06_vqa", "skipped", "Human review is not completed; OpenAI API was not called")
+            self.status("07_final", "skipped", "No draft VQA exists")
+            return self.reporter.write(self.manifest, preprocessing, clip_results, pending, None)
+
+        try:
+            review = HumanReview.model_validate_json(review_path.read_text(encoding="utf-8"))
+            if review.video_id != self.config.video_path.stem:
+                raise ValueError("Human review video_id mismatch")
+            verified = apply_human_review(pending, review, review_dir)
+            self.status("05_human_review", "completed", f"{len(verified.objects)} approved/modified objects", artifact="05_human_review/verified_annotations.json")
+        except Exception as exc:
+            return self.fail_remaining("05_human_review", f"{type(exc).__name__}: {exc}", preprocessing, clip_results, pending)
+
+        try:
+            vqa_path = output / "06_vqa" / "generated_vqa.json"
+            if vqa_path.exists():
+                draft = DraftVQABatch.model_validate_json(vqa_path.read_text(encoding="utf-8"))
             else:
-                print(f"Track description {index + 1}/{len(merged['global_tracks'])}", flush=True)
-                description = self.dam.describe(track)
-                self.writer.write_json(description_path, description.model_dump(mode="json"))
-            descriptions.append(description)
+                api_key = os.getenv("OPENAI_API_KEY", "")
+                if not api_key:
+                    raise RuntimeError("OPENAI_API_KEY is missing")
+                draft = OpenAIVQAGenerator(OpenAI(api_key=api_key, timeout=300.0), self.config.openai_model).run(verified, output / "06_vqa")
+            self.status("06_vqa", "completed", f"{len(draft.items)} draft questions; final review required", model=self.config.openai_model, artifacts=["06_vqa/prompt.txt", "06_vqa/raw_response.json", "06_vqa/generated_vqa.json"])
+        except Exception as exc:
+            return self.fail_remaining("06_vqa", f"{type(exc).__name__}: {exc}", preprocessing, clip_results, pending)
 
-        annotation_path = output_root / "annotation_before_sam3.json"
-        if annotation_path.exists():
-            annotation = TrackedAnnotation.model_validate_json(
-                annotation_path.read_text(encoding="utf-8")
-            )
-            normalization_meta = {"resumed_from_existing_artifact": True}
-        else:
-            annotation, normalization_meta = self.analyzer.normalize(merged, descriptions)
-            self.writer.write_json(annotation_path, annotation.model_dump(mode="json"))
-
-        verifications = self.sam3.verify(annotation, merged)
-        verified_annotation = self.analyzer.apply_sam3_results(annotation, verifications)
-        self.writer.write_json(
-            output_root / "annotation.json", verified_annotation.model_dump(mode="json")
-        )
-        vqa, vqa_meta = self.analyzer.generate_vqa(
-            verified_annotation, self.config.strict_verification
-        )
-        self.writer.write_json(output_root / "vqa.json", vqa.model_dump(mode="json"))
-
-        manifest = {
-            "schema_version": "0.3.0-track-grounded",
-            "video_id": video_id,
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-            "requirements": {
-                "source_fps_preserved": True,
-                "clip_seconds": self.config.clip_seconds,
-                "stride_seconds": self.config.stride_seconds,
-                "sam2_tracking_fps": self.config.tracking_fps,
-                "dam_max_frames_per_track": 8,
-                "timestamps_are_evidence_metadata_only": True,
-                "unsupported_change_questions_are_skipped": True,
-                "overlap_deduplicated_before_vqa": True,
-            },
-            "stages": {
-                "01_preprocessing": {"status": "executed", "output": preprocessing},
-                "02_sam2_tracking": {"status": "executed", "output": track_results},
-                "03_overlap_merge": {"status": "executed", "output": merged},
-                "04_dam_description": {
-                    "status": (
-                        "executed"
-                        if all(item.provider_status == "executed" for item in descriptions)
-                        else "fallback"
-                    ),
-                    "fallback_is_not_dam_output": any(
-                        item.provider_status == "fallback" for item in descriptions
-                    ),
-                    "output": [item.model_dump(mode="json") for item in descriptions],
-                },
-                "05_openai_normalization": {
-                    "status": "executed",
-                    "model": self.config.model,
-                    "api": normalization_meta,
-                    "output": annotation.model_dump(mode="json"),
-                },
-                "06_sam3_verification": {
-                    "status": (
-                        "executed"
-                        if all(item.status != "blocked" for item in verifications)
-                        else "blocked"
-                    ),
-                    "output": [item.model_dump(mode="json") for item in verifications],
-                },
-                "07_vqa": {
-                    "status": "executed",
-                    "model": self.config.model,
-                    "strict_verification": self.config.strict_verification,
-                    "api": vqa_meta,
-                    "output": vqa.model_dump(mode="json"),
-                },
-            },
-        }
-        self.writer.write_json(output_root / "manifest.json", manifest)
-        return self.writer.write_report(manifest)
+        final_dir = output / "07_final"
+        final_review_path = final_dir / "final_review.json"
+        if not final_review_path.exists():
+            final_dir.mkdir(parents=True, exist_ok=True)
+            self.status("07_final", "pending_review", "Review every draft Q&A in report.html and save final_review.json here")
+            return self.reporter.write(self.manifest, preprocessing, clip_results, pending, draft.model_dump(mode="json"))
+        try:
+            final_review = FinalVQAReview.model_validate_json(final_review_path.read_text(encoding="utf-8"))
+            final = apply_final_review(draft, final_review, final_dir)
+            self.status("07_final", "completed", f"{len(final['items'])} human-verified benchmark questions", artifact="07_final/verified_vqa.json")
+        except Exception as exc:
+            return self.fail_remaining("07_final", f"{type(exc).__name__}: {exc}", preprocessing, clip_results, pending)
+        return self.reporter.write(self.manifest, preprocessing, clip_results, pending, draft.model_dump(mode="json"))
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the track-grounded industrial VideoQA MVP")
+    parser = argparse.ArgumentParser(description="Revised track-grounded VQA dataset pipeline")
     parser.add_argument("--video", type=Path, default=DEFAULT_VIDEO)
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
-    parser.add_argument("--model", default=None)
-    parser.add_argument("--sam2-python", type=Path, default=PROJECT_ROOT / ".venv-sam2/bin/python")
-    parser.add_argument("--strict-models", action="store_true")
-    parser.add_argument("--strict-verification", action="store_true")
+    parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--segmenter", choices=("sam2", "sam3"), default="sam2")
+    parser.add_argument("--vision-python", type=Path, default=PROJECT_ROOT / ".venv-sam2/bin/python")
+    parser.add_argument("--qwen-python", type=Path, default=PROJECT_ROOT / ".venv-qwen/bin/python")
+    parser.add_argument("--openai-model", default=None)
+    parser.add_argument("--naming-model", default="mlx-community/Qwen3.5-9B-MLX-4bit")
+    parser.add_argument("--stop-after", choices=("sam", "naming", "vqa"), default="vqa")
+    parser.add_argument("--redetect-interval-frames", type=int, default=10)
+    parser.add_argument("--lean", action="store_true", help="Skip visualization/report files and retain only data needed by later stages")
     return parser.parse_args()
 
 
 def main() -> int:
-    args = parse_args()
     load_dotenv(PROJECT_ROOT / ".env", override=True)
-    api_key = os.getenv("OPENAI_API_KEY", "")
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY is missing")
-    config = TrackedPipelineConfig(
-        video_path=args.video.resolve(),
-        output_root=args.output_dir.resolve(),
-        model=args.model or os.getenv("OPENAI_MODEL", "gpt-6.1-terra"),
-        sam2_python=args.sam2_python.absolute(),
-        strict_models=args.strict_models,
-        strict_verification=args.strict_verification,
-        dam_base_url=os.getenv("DAM_BASE_URL") or None,
-        sam3_base_url=os.getenv("SAM3_BASE_URL") or None,
+    args = parse_args()
+    default_output = DEFAULT_OUTPUT if args.segmenter == "sam3" else PROJECT_ROOT / "outputs" / "0_te1_sam2"
+    config = Config(
+        video_path=args.video.resolve(), output_root=(args.output_dir or default_output).resolve(),
+        vision_python=args.vision_python.absolute(), qwen_python=args.qwen_python.absolute(),
+        openai_model=args.openai_model or os.getenv("OPENAI_MODEL", "gpt-6.1-terra"),
+        naming_model=args.naming_model,
+        stop_after=args.stop_after,
+        segmenter=args.segmenter,
+        redetect_interval_frames=args.redetect_interval_frames,
+        lean=args.lean,
     )
-    print(TrackedVQAPipeline(config, api_key).run())
+    pipeline = Pipeline(config)
+    print(pipeline.run())
+    if any(stage.get("status") == "failed" for stage in pipeline.manifest["stages"].values()):
+        return 1
     return 0
 
 
